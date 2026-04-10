@@ -1,0 +1,71 @@
+✅: interpolation for GO is not saliently disturbed
+❌: interpolation for GO is saliently disturbed
+🟡: mixed, it is bad, but understandable/tolerable
+if affect background too much, then it is negatively taken too
+
+UPR-Net:
++ consistent_static: ✅ No disturbance on the GO at all. Though handled poorly for largemotion, and when GO occlude too much to correctly inference the motion 
++ consistent_static_motion: 🟡 Fine features are mildly blurred, especially when background moves there too. Moving text is bad sometimes. Pretty good otherwise, all affine. Background is the same way as consistent_static
++ consistent_static_motion_transparent: 🟡 Surprisingly, it understood transparency well, other than that refer to static_motion. Sometime the interpolated transparent object is interpolated solid (non-transparent) when visibile texture (in that transparent region) is complex
++ consistent_static_transparent: ✅ Wow. GO don't break, though the solidify problem persist (but less since there is less complexity)
++ object_color_change: 🟡 GO geometry dont break. Color tried to interprete mid-point, though probably because of how flow work *sometimes* the color isn't samely (at the same rate) filled (even though it is expected to)
++ object_disappear: ❌ it tried to warp the dis/appearance midpoint, it's very understandable and the best outcome given that it doesn't understand and doesn't disambiguate.
++ object_shape_change: ❌ it tried to warp the shape change midpoint, it's very understandable and the best outcome given that it doesn't understand and doesn't disambiguate.
++ object_texture_change: ❌ it tried to warp the texture midpoint, it's very understandable and the best outcome given that it doesn't understand and doesn't disambiguate.
++ object_visibility_change: 🟡 as before, color and transparency are handled well, the case it fails is when background motion is complex under where the GO is, so the intrinsic texture of the GO and the background under GO is not correctly interpolated, this is rare though. Doesn't break anything outside the GO region.
++ scenechange: ❌ abomination
++ scenechange_preserved_go: ❌ background is abomination, but GO remains perfectly interpolated. Interestingly, the background surrounding GO has friction to not go into abomination.
++++overall: UPR has good GO correspondance and separation, handle color and transparency pretty okay, and interpolate mid-point assumption well. Is bad at very large motion (and therefore fine object as well), edge is a bit blurry too.
+
+EDEN:
++ consistent_static: 🟡 GO mostly dont break, but when motion underneath is incomprehensible to it, it break the GO. When EDEN hallucinate anything the result is gross.
++ consistent_static_motion: ❌ small object / slightly large motion is dead with scary artifact
++ consistent_static_motion_transparent: ❌ same thing because of motion. but it understood transparency well
++ consistent_static_transparent: ✅ even better than solid consistent_static, transparency is perfectly handled, as if it interpolated the background first, then parse back the transparent GO
++ object_color_change: 🟡 it tried to interpolate color midpoint, but with unequal rate, slightly worse than upr. (when motion it breaks again)
++ object_disappear: ❌ noisy hallucinate 
++ object_shape_change: ❌ it tried interpolate mid-way, with blur. and when object is big there is noise artifact
++ object_texture_change: ❌ it tried interpolate mid-way, with blur
++ object_visibility_change: 🟡 when underlay is complex, the transparent will break underlay, but overlay is good as long as no motion, visibility change doesn't affect. motion breaks things, always
++ scenechange: 🟡 fade in/out scene change is well done, sudden is bleh
++ scenechange_preserved_go: ❌ GO are broken under motion, even so when complete scene change it eats a bit into GO quality too
++++overall: thanks to it being not flow but diffusion, it is expectable that output will be very good if motion is small, but when it's slightly big, it hallucinates very bad. transparency pretty good, even when changing. feels noisy overall, but more sophisticated when the assumption is right (small motion)
+
+MambaVFI:
++ consistent_static: ✅ GO is disentangled well, though background motion is blurry as hell, backbone issue. It seems GO slightly has effect on background as well
++ consistent_static_motion: ❌ fine GO saliently blurred under motion, big GO are interpolated perfectly though
++ consistent_static_motion_transparent: ❌ thanks to motion, blur. transparency causes the underlay is be mildly blurred too 
++ consistent_static_transparent: ✅ transparency is well handled, backbone issue for background. there is one case the underlay is extreme and it affected the GO badly (so either affected badly, or not affected at all)
++ object_color_change: ✅ color change interpolation done perfectly, evenly shifted
++ object_disappear: ❌ blur
++ object_shape_change: ❌ blur
++ object_texture_change: ❌ it tried interpolating midpoint, pretty good at that. what else to expect?
++ object_visibility_change: ✅ color and transparency are handled extremely well, even when it's changing. If anything, (natural) large motion breaks things. When underlay and GO's texture move complexly, it breaks the GO texture (but not background, huh)
++ scenechange: ❌ both are gross
++ scenechange_preserved_go: ❌ GO are broken under motion, even so when complete scene change it eats a bit into GO quality too
++++ When blur, the blur is much smoother than the gross EDEN. Like EDEN, one can expect good result if motion are small here, because color is perfectly done (transparency isn't as perfect as EDEN)
+
+Model-specific:
++ Flow: Object-tracking and motion-estimation is good, even in largemotion. But *I guess* the resolution wouldn't be as good. Texture is influenced by neighbouring flow so the edges is worse.
++ Diffusion: Resolution is good, but above 2 backbones suck at motion. Consistent textures are handled well...
++ Attention: idk, what exactly used attention
+
+Cross-model observations, with a lean toward what THE BEST OF VFI would perform (these 3 certainly are not)
++ The major inconsistencies are dis/appear, shape-change, textural change and scene-change
++ Transparency are well handled
++ Color could be well handled
++ Motion could be handled well, for above if motion is small then GO and background don't break in any non-major-inconsistent case, so I expect SOTA in largemotion wouldn't have problem
+
+Verdict (as to what mode is consistent and what not), scale 1->5 for 5 is very inconsistent
+
++ consistent_static: 1
++ consistent_static_motion: 2
++ consistent_static_motion_transparent: 2
++ consistent_static_transparent: 1
++ object_color_change: 2
++ object_disappear: 5
++ object_shape_change: 5
++ object_texture_change: 4
++ object_visibility_change: 2
++ scenechange: 5
++ scenechange_preserved_go: 5

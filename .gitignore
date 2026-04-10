@@ -1,0 +1,25 @@
+# Python cache artifacts.
+__pycache__/
+*.py[cod]
+
+venv/
+
+# Ignore dataset payloads, but keep scripts and lightweight metadata in Datasets/.
+Datasets/**
+Test/
+!Datasets/**/
+!Datasets/**/*.py
+!Datasets/**/*.sh
+!Datasets/**/*.md
+!Datasets/**/*.txt
+
+# Large local model artifacts.
+GOSeg/*.pt
+GOSeg/*.pth
+GOSeg/*.ckpt
+GOSeg/*.safetensors
+GOSeg/*.zip
+GOSeg/__MACOSX/
+MAT/pretrained/
+UPR-Net/checkpoints/
+
