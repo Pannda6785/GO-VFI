@@ -31,10 +31,12 @@ from GOBC.train import (
     build_dataset,
     build_loader,
     build_model,
+    filter_finite_batch_tensors,
     load_config,
     make_device,
     move_batch,
     prepare_epoch_subsets,
+    sanitize_binary_metrics_inputs,
 )
 
 
@@ -296,13 +298,21 @@ def evaluate_checkpoint(args: argparse.Namespace) -> None:
     device = make_device()
     model = build_model(config).to(device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint_config = checkpoint.get("config")
+    if isinstance(checkpoint_config, dict):
+        resolved_pos_weight = (checkpoint_config.get("train") or {}).get("resolved_pos_weight")
+        if resolved_pos_weight is not None:
+            config.setdefault("train", {})["resolved_pos_weight"] = resolved_pos_weight
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
     dataset = build_dataset(config, split=args.split)
     epoch_subsets = prepare_epoch_subsets(config, dataset, args.split, 1)
     loader = build_loader(config, dataset=dataset, split=args.split, shuffle=False, epoch_index=0, epoch_subsets=epoch_subsets)
-    criterion = build_criterion(config, device)
+    train_dataset_for_loss = None
+    if "resolved_pos_weight" not in config.get("train", {}):
+        train_dataset_for_loss = build_dataset(config, split="train")
+    criterion = build_criterion(config, device, train_dataset=train_dataset_for_loss)
     labels: list[float] = []
     scores: list[float] = []
     losses: list[float] = []
@@ -316,20 +326,32 @@ def evaluate_checkpoint(args: argparse.Namespace) -> None:
 
     with torch.no_grad():
         for batch in loader:
-            batch = move_batch(batch, device)
+            batch = move_batch(batch, device, include_label=False)
             output = model(batch["image1"], batch["mask1"], batch["image2"], batch["mask2"])
             if output.logits.numel() == 0:
                 continue
             valid_indices = output.valid_indices
-            labels_batch = batch["label"].index_select(0, valid_indices)
-            loss = criterion(output.logits, labels_batch)
-            probs = output.prob.detach().cpu().numpy()
-            labels_np = labels_batch.detach().cpu().numpy()
+            valid_indices_cpu = valid_indices.detach().cpu()
+            labels_batch_cpu = batch["label"].index_select(0, valid_indices_cpu)
+            labels_batch = labels_batch_cpu.to(device)
+            finite = torch.isfinite(output.logits) & torch.isfinite(output.prob) & torch.isfinite(labels_batch)
+            if not finite.any():
+                continue
+            logits_batch = output.logits[finite]
+            probs_batch = output.prob[finite]
+            labels_batch = labels_batch[finite]
+            finite_cpu = finite.detach().cpu()
+            labels_batch_cpu = labels_batch_cpu[finite_cpu]
+            loss = criterion(logits_batch, labels_batch)
+            probs = probs_batch.detach().cpu().numpy()
+            labels_np = (labels_batch_cpu.numpy() >= 0.5).astype(np.int64)
             preds = (probs >= 0.5).astype(np.float32)
             losses.append(loss.item())
             labels.extend(labels_np.tolist())
             scores.extend(probs.tolist())
-            valid_positions = valid_indices.detach().cpu().tolist()
+            valid_positions = valid_indices_cpu.tolist()
+            if not finite_cpu.all():
+                valid_positions = [valid_positions[i] for i, keep in enumerate(finite_cpu.tolist()) if keep]
             source_rels = [batch["source_rel"][i] for i in valid_positions]
             object_ids = [batch["object_id"][i] for i in valid_positions]
             temporal_modes = [batch["temporal_mode"][i] for i in valid_positions]
@@ -381,8 +403,7 @@ def evaluate_checkpoint(args: argparse.Namespace) -> None:
                 else:
                     keep_top_examples(true_negative_examples, {**visual_candidate, "priority": float(1.0 - probs[idx])}, args.top_k_visuals)
 
-    labels_arr = np.asarray(labels, dtype=np.float32)
-    scores_arr = np.asarray(scores, dtype=np.float32)
+    labels_arr, scores_arr = sanitize_binary_metrics_inputs(labels, scores)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

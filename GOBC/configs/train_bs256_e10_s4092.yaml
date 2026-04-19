@@ -12,8 +12,9 @@ data:
   image_size: 224
   patch_size: 14
   min_patch_tokens: 1
+  swap_pair_probability: 0.5
   crop_margin: 0.15
-  mask_threshold: 0.5
+  mask_threshold: 0.3
   val_split: val
   subset_seed: 0
   max_train_samples: 4092
@@ -25,7 +26,8 @@ train:
   epochs: 20
   lr: 1.0e-4
   weight_decay: 1.0e-4
-  pos_weight: 3.0
+  max_grad_norm: 1.0
+  pos_weight: 2.209272376046362
   num_workers: 0
   amp: true
   log_every_steps: 2

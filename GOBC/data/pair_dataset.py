@@ -16,6 +16,7 @@ from GOBC.models.dinov2_backbone import DINO_MEAN, DINO_STD
 
 
 VALID_SPLITS = {"train", "val", "test"}
+CENTER_EDGE_MARGIN_FRACTION = 1.0 / 16.0
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,11 @@ class OverlaySample:
     image2_path: str
     mask1_path: str
     mask2_path: str
+
+
+def _load_image_size(path: Path) -> tuple[int, int]:
+    with Image.open(path) as image:
+        return image.size
 
 
 def _has_scene_change(value: Any) -> bool:
@@ -75,6 +81,38 @@ def _mask_paths_for_overlay(meta_dir: Path, overlay: dict[str, Any]) -> tuple[Pa
     return meta_dir / "overlays_masks" / f"{object_id}_I0.png", meta_dir / "overlays_masks" / f"{object_id}_I1.png"
 
 
+def _overlay_center(overlay: dict[str, Any], key: str) -> Any:
+    if key in overlay:
+        return overlay.get(key)
+    geometry = overlay.get("geometry") or {}
+    return geometry.get(key)
+
+
+def _center_inside_frame(center: Any, image_size: tuple[int, int]) -> bool:
+    if center is None:
+        return True
+    if not isinstance(center, (list, tuple)) or len(center) != 2:
+        return False
+    x, y = center
+    if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+        return False
+    width, height = image_size
+    edge_margin = float(width) * CENTER_EDGE_MARGIN_FRACTION
+    x = float(x)
+    y = float(y)
+    return edge_margin <= x < float(width) - edge_margin and edge_margin <= y < float(height) - edge_margin
+
+
+def _overlay_centers_inside_frames(
+    overlay: dict[str, Any],
+    image1_size: tuple[int, int],
+    image2_size: tuple[int, int],
+) -> bool:
+    return _center_inside_frame(_overlay_center(overlay, "center0"), image1_size) and _center_inside_frame(
+        _overlay_center(overlay, "center1"), image2_size
+    )
+
+
 def build_pair_index(dataset_root: str | Path, split: str) -> list[OverlaySample]:
     if split not in VALID_SPLITS:
         raise ValueError(f"Unsupported split {split!r}. Expected one of {sorted(VALID_SPLITS)}.")
@@ -93,13 +131,20 @@ def build_pair_index(dataset_root: str | Path, split: str) -> list[OverlaySample
             continue
 
         meta_dir = metadata_path.parent
+        image1_path = meta_dir / "I0.png"
+        image2_path = meta_dir / "I1.png"
+        if not image1_path.exists() or not image2_path.exists():
+            continue
+        image1_size = _load_image_size(image1_path)
+        image2_size = _load_image_size(image2_path)
         for overlay in overlays:
             label = derive_overlay_label(overlay)
             if label is None:
                 continue
 
-            image1_path = meta_dir / "I0.png"
-            image2_path = meta_dir / "I1.png"
+            if not _overlay_centers_inside_frames(overlay, image1_size, image2_size):
+                continue
+
             mask1_path, mask2_path = _mask_paths_for_overlay(meta_dir, overlay)
             if not all(path.exists() for path in (image1_path, image2_path, mask1_path, mask2_path)):
                 continue
@@ -152,6 +197,8 @@ class VimeoOverlayPairDataset(Dataset[dict[str, Any]]):
         normalize: bool = True,
         patch_size: int = 14,
         min_patch_tokens: int = 1,
+        mask_threshold: float = 0.3,
+        swap_pair_probability: float = 0.5,
     ) -> None:
         self.dataset_root = Path(dataset_root)
         self.split = split
@@ -160,6 +207,8 @@ class VimeoOverlayPairDataset(Dataset[dict[str, Any]]):
         self.normalize = normalize
         self.patch_size = patch_size
         self.min_patch_tokens = min_patch_tokens
+        self.mask_threshold = float(mask_threshold)
+        self.swap_pair_probability = float(swap_pair_probability)
         self.samples = build_pair_index(dataset_root, split)
 
     def __len__(self) -> int:
@@ -173,7 +222,7 @@ class VimeoOverlayPairDataset(Dataset[dict[str, Any]]):
     def _load_mask(path: str) -> Image.Image:
         return Image.open(path).convert("L")
 
-    def _prepare_tensors(self, sample: OverlaySample) -> dict[str, Any]:
+    def _prepare_tensors(self, sample: OverlaySample, allow_swap: bool = True) -> dict[str, Any]:
         image1 = self._load_rgb(sample.image1_path)
         image2 = self._load_rgb(sample.image2_path)
         mask1 = self._load_mask(sample.mask1_path)
@@ -196,6 +245,16 @@ class VimeoOverlayPairDataset(Dataset[dict[str, Any]]):
 
         mask1_tensor = (TF.to_tensor(mask1) > 0.5).float()
         mask2_tensor = (TF.to_tensor(mask2) > 0.5).float()
+
+        if (
+            allow_swap
+            and self.split == "train"
+            and self.swap_pair_probability > 0.0
+            and torch.rand(()) < self.swap_pair_probability
+        ):
+            image1_tensor, image2_tensor = image2_tensor, image1_tensor
+            mask1_tensor, mask2_tensor = mask2_tensor, mask1_tensor
+
         self._validate_patch_visibility(mask1_tensor, mask2_tensor)
 
         return {
@@ -212,19 +271,19 @@ class VimeoOverlayPairDataset(Dataset[dict[str, Any]]):
 
     def _validate_patch_visibility(self, mask1_tensor: torch.Tensor, mask2_tensor: torch.Tensor) -> None:
         grid_hw = (self.image_size // self.patch_size, self.image_size // self.patch_size)
-        patch_mask1 = F.interpolate(mask1_tensor.unsqueeze(0), size=grid_hw, mode="nearest").flatten(2).squeeze(0)
-        patch_mask2 = F.interpolate(mask2_tensor.unsqueeze(0), size=grid_hw, mode="nearest").flatten(2).squeeze(0)
-        if int((patch_mask1 > 0.5).sum().item()) < self.min_patch_tokens:
+        patch_mask1 = F.interpolate(mask1_tensor.unsqueeze(0), size=grid_hw, mode="area").flatten(2).squeeze(0)
+        patch_mask2 = F.interpolate(mask2_tensor.unsqueeze(0), size=grid_hw, mode="area").flatten(2).squeeze(0)
+        if int((patch_mask1 > self.mask_threshold).sum().item()) < self.min_patch_tokens:
             raise ValueError("Mask1 collapsed to too few DINO patch tokens after preprocessing.")
-        if int((patch_mask2 > 0.5).sum().item()) < self.min_patch_tokens:
+        if int((patch_mask2 > self.mask_threshold).sum().item()) < self.min_patch_tokens:
             raise ValueError("Mask2 collapsed to too few DINO patch tokens after preprocessing.")
 
     def is_valid_index(self, index: int) -> bool:
         try:
-            self._prepare_tensors(self.samples[index])
+            self._prepare_tensors(self.samples[index], allow_swap=False)
         except (OSError, ValueError):
             return False
         return True
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        return self._prepare_tensors(self.samples[index])
+        return self._prepare_tensors(self.samples[index], allow_swap=True)

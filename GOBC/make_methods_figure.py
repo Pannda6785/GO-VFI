@@ -222,8 +222,9 @@ def make_figure(output_path: Path) -> None:
         draw,
         (90, 920, 520, 1220),
         "Normalization + Validity",
-        "Images are normalized with DINO mean/std. Masks are nearest-resized and later projected to the 16x16 patch "
-        "grid. Samples with zero foreground patch tokens in either branch are dropped before loss.",
+        "Images are normalized with DINO mean/std. Masks are projected to the 16x16 patch grid with area "
+        "interpolation. A hard mask is defined as soft-mask area > 0.3, and samples with zero hard-mask patch "
+        "tokens in either branch are dropped before loss.",
         title_font=box_title_font,
         body_font=body_font,
         fill=CARD_ALT,
@@ -252,7 +253,7 @@ def make_figure(output_path: Path) -> None:
         (670, 740, 1120, 1090),
         "Patch Tokens + Patch Masks",
         "Backbone output: tokens1, tokens2 in [B,256,768]. Masks are resized to 16x16 and flattened to "
-        "patch_mask1, patch_mask2 in [B,256] using nearest-neighbor thresholding at 0.5.",
+        "Per branch: soft patch masks from area projection and hard patch masks from soft_mask > 0.3, both in [B,256].",
         title_font=box_title_font,
         body_font=body_font,
         fill="#eef4f1",

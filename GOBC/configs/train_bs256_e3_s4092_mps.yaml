@@ -17,21 +17,24 @@ data:
   mask_threshold: 0.3
   val_split: val
   subset_seed: 0
-  max_train_samples: 4096
+  max_train_samples: 4092
   max_val_samples: 512
+  distinct_train_subset_per_epoch: true
 
 train:
-  batch_size: 2
-  epochs: 1
+  batch_size: 256
+  epochs: 3
   lr: 1.0e-4
   weight_decay: 1.0e-4
   max_grad_norm: 1.0
   pos_weight: 2.209272376046362
   num_workers: 0
   amp: true
-  log_every_steps: 100
-  checkpoint_every_steps: 500
-  output_dir: Test/GOBC_smoke_20min
+  log_every_steps: 2
+  checkpoint_every_steps: 8
+  output_dir: Test/GOBC_train_bs256_e3_s4092_mps
 
 eval:
   primary_metric: auroc
+  batch_size: 128
+  device: mps

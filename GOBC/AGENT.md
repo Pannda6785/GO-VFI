@@ -64,9 +64,11 @@ Acceptance criteria:
 
 Implement utilities to map masks to patch tokens:
 
-* resize mask to patch grid using nearest-neighbor
+* resize mask to patch grid using area interpolation
 * flatten to `[B, N]`
-* define valid object tokens as `mask > threshold`
+* keep both:
+  * a soft patch mask from the projected area values
+  * a hard patch mask from `soft_mask > threshold`
 
 Do **not** do boundary/interior splitting.
 Only use the mask as:
@@ -161,6 +163,9 @@ Sequence-level filtering:
 Overlay-level filtering and labeling:
 
 * drop overlays where `temporal.mode == "appear_disappear"`
+* drop overlays where the endpoint center-of-mass metadata is too close to the frame edge:
+  * `center0` must lie at least `frame_width / 16` away from every edge of `I0`
+  * `center1` must lie at least `frame_width / 16` away from every edge of `I1`
 * label `different` iff:
   * `temporal.mode == "change_appearance"`
   * and either:
@@ -179,6 +184,9 @@ Implementation notes:
 * do not reuse the dataset's original discontinuity label blindly if it conflicts with the rule above
 * do not infer textual change from `goons.class_name`; use `temporal.detail.variant` and, for composite overlays, `temporal.detail.components`
 * keep the pairing endpoint-only for GOBC v1: `(I0, mask_I0)` vs `(I1, mask_I1)`
+* for train sampling only, allow a non-duplicating random endpoint swap:
+  * with probability `p`, feed `(I1, mask_I1, I0, mask_I0)` instead of `(I0, mask_I0, I1, mask_I1)`
+  * do not duplicate the dataset index for this; apply it at sample fetch time
 * use a shared union crop for both frames so the pair stays spatially aligned
 * design the dataset and collate path for batched training from the start; do not build a single-sample-only pipeline first
 
@@ -279,7 +287,7 @@ model:
 data:
   image_size: 518
   crop_margin: 0.15
-  mask_threshold: 0.5
+  mask_threshold: 0.3
 
 train:
   batch_size: 16
