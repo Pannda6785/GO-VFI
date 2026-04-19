@@ -478,14 +478,16 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         train_losses: list[float] = []
         for step, batch in enumerate(train_loader):
-            batch = move_batch(batch, device)
+            batch = move_batch(batch, device, include_label=False)
             optimizer.zero_grad(set_to_none=True)
             autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
             with autocast_ctx:
                 output = model(batch["image1"], batch["mask1"], batch["image2"], batch["mask2"])
                 if output.logits.numel() == 0:
                     continue
-                labels_batch = batch["label"].index_select(0, output.valid_indices)
+                valid_indices_cpu = output.valid_indices.detach().cpu()
+                labels_batch_cpu = batch["label"].index_select(0, valid_indices_cpu)
+                labels_batch = labels_batch_cpu.to(device)
                 logits_batch, probs_batch, labels_batch = filter_finite_batch_tensors(
                     output.logits,
                     output.prob,

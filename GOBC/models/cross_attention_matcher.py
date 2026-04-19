@@ -30,10 +30,32 @@ def project_mask_to_patch_grid(
     )
 
 
-def masked_mean_pool(tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    weights = mask.float().unsqueeze(-1)
-    denom = weights.sum(dim=1).clamp_min(1.0)
-    return (tokens * weights).sum(dim=1) / denom
+def tokens_to_map(tokens: torch.Tensor, grid_hw: tuple[int, int]) -> torch.Tensor:
+    if tokens.ndim != 3:
+        raise ValueError(f"Expected [B, N, C] tokens, got {tuple(tokens.shape)}")
+    height, width = grid_hw
+    if tokens.shape[1] != height * width:
+        raise ValueError(f"Token count {tokens.shape[1]} does not match grid {grid_hw}.")
+    return tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[2], height, width)
+
+
+def mask_to_map(mask: torch.Tensor, grid_hw: tuple[int, int]) -> torch.Tensor:
+    if mask.ndim != 2:
+        raise ValueError(f"Expected [B, N] mask, got {tuple(mask.shape)}")
+    height, width = grid_hw
+    if mask.shape[1] != height * width:
+        raise ValueError(f"Mask token count {mask.shape[1]} does not match grid {grid_hw}.")
+    return mask.reshape(mask.shape[0], 1, height, width)
+
+
+def masked_avg(score_map: torch.Tensor, valid_map: torch.Tensor) -> torch.Tensor:
+    if score_map.shape != valid_map.shape:
+        raise ValueError(
+            f"Expected score_map and valid_map to match, got {tuple(score_map.shape)} vs {tuple(valid_map.shape)}."
+        )
+    numer = (score_map * valid_map).sum(dim=(1, 2, 3))
+    denom = valid_map.sum(dim=(1, 2, 3)).clamp_min(1.0)
+    return numer / denom
 
 
 class CrossAttentionBlock(nn.Module):
@@ -69,6 +91,25 @@ class CrossAttentionBlock(nn.Module):
         return out * query_soft_mask.unsqueeze(-1)
 
 
+class SpatialRelationHead(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_dim, hidden_dim, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(hidden_dim)
+        self.conv2 = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(hidden_dim)
+        self.out = nn.Conv2d(hidden_dim, 1, kernel_size=1)
+
+    def forward(self, relation_map: torch.Tensor) -> torch.Tensor:
+        x = self.conv1(relation_map.contiguous())
+        x = self.bn1(x.contiguous())
+        x = F.gelu(x)
+        x = self.conv2(x.contiguous())
+        x = self.bn2(x.contiguous())
+        x = F.gelu(x)
+        return self.out(x.contiguous())
+
+
 @dataclass
 class ModelOutput:
     logits: torch.Tensor
@@ -81,6 +122,9 @@ class ModelOutput:
     soft_mask2: torch.Tensor | None
     embedding1: torch.Tensor | None
     embedding2: torch.Tensor | None
+    relation_map: torch.Tensor | None
+    valid_map: torch.Tensor | None
+    score_map: torch.Tensor | None
     valid_indices: torch.Tensor
 
 
@@ -97,6 +141,7 @@ class PairwiseDifferenceModel(nn.Module):
         dropout: float = 0.0,
         mask_threshold: float = 0.3,
         return_debug_tensors: bool = False,
+        conv_hidden_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.backbone = backbone or DinoV2Backbone(
@@ -110,12 +155,8 @@ class PairwiseDifferenceModel(nn.Module):
         self.proj = nn.LazyLinear(proj_dim)
         self.cross_12 = CrossAttentionBlock(proj_dim, num_heads, dropout)
         self.cross_21 = CrossAttentionBlock(proj_dim, num_heads, dropout)
-        self.head = nn.Sequential(
-            nn.Linear(proj_dim * 4, proj_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(proj_dim, 1),
-        )
+        conv_hidden_dim = int(conv_hidden_dim or proj_dim)
+        self.head = SpatialRelationHead(proj_dim * 4, conv_hidden_dim)
 
     def forward(
         self,
@@ -129,13 +170,16 @@ class PairwiseDifferenceModel(nn.Module):
         patch_masks1 = project_mask_to_patch_grid(mask1, grid1, self.mask_threshold)
         patch_masks2 = project_mask_to_patch_grid(mask2, grid2, self.mask_threshold)
         valid = patch_masks1.hard_mask.any(dim=1) & patch_masks2.hard_mask.any(dim=1)
+        if grid1 != grid2:
+            raise ValueError(f"Mismatched patch grids: {grid1} vs {grid2}.")
 
         if not valid.any():
             empty = tokens1.new_empty((0,))
             empty_tokens = tokens1.new_empty((0, tokens1.shape[1], self.proj.out_features))
             empty_hard_mask = patch_masks1.hard_mask.new_empty((0, patch_masks1.hard_mask.shape[1]))
             empty_soft_mask = tokens1.new_empty((0, patch_masks1.hard_mask.shape[1]))
-            empty_embed = tokens1.new_empty((0, self.proj.out_features))
+            empty_map = tokens1.new_empty((0, self.proj.out_features * 4, grid1[0], grid1[1]))
+            empty_scalar_map = tokens1.new_empty((0, 1, grid1[0], grid1[1]))
             return ModelOutput(
                 logits=empty,
                 prob=empty,
@@ -145,8 +189,11 @@ class PairwiseDifferenceModel(nn.Module):
                 mask2=empty_hard_mask if self.return_debug_tensors else None,
                 soft_mask1=empty_soft_mask if self.return_debug_tensors else None,
                 soft_mask2=empty_soft_mask if self.return_debug_tensors else None,
-                embedding1=empty_embed if self.return_debug_tensors else None,
-                embedding2=empty_embed if self.return_debug_tensors else None,
+                embedding1=None,
+                embedding2=None,
+                relation_map=empty_map if self.return_debug_tensors else None,
+                valid_map=empty_scalar_map if self.return_debug_tensors else None,
+                score_map=empty_scalar_map if self.return_debug_tensors else None,
                 valid_indices=valid.nonzero(as_tuple=False).squeeze(-1),
             )
 
@@ -165,13 +212,16 @@ class PairwiseDifferenceModel(nn.Module):
         attended1 = self.cross_12(tokens1, tokens2, soft_mask1, patch_mask2)
         attended2 = self.cross_21(tokens2, tokens1, soft_mask2, patch_mask1)
 
-        embedding1 = masked_mean_pool(attended1, soft_mask1)
-        embedding2 = masked_mean_pool(attended2, soft_mask2)
+        norm_attended1 = F.normalize(attended1, dim=-1)
+        norm_attended2 = F.normalize(attended2, dim=-1)
         relation = torch.cat(
-            [embedding1, embedding2, torch.abs(embedding1 - embedding2), embedding1 * embedding2],
+            [norm_attended1, norm_attended2, torch.abs(norm_attended1 - norm_attended2), norm_attended1 * norm_attended2],
             dim=-1,
         )
-        logits = self.head(relation).squeeze(-1)
+        relation_map = tokens_to_map(relation, grid1)
+        valid_map = torch.maximum(mask_to_map(soft_mask1, grid1), mask_to_map(soft_mask2, grid1))
+        score_map = self.head(relation_map)
+        logits = masked_avg(score_map, valid_map)
         return ModelOutput(
             logits=logits,
             prob=torch.sigmoid(logits),
@@ -181,7 +231,10 @@ class PairwiseDifferenceModel(nn.Module):
             mask2=patch_mask2 if self.return_debug_tensors else None,
             soft_mask1=soft_mask1 if self.return_debug_tensors else None,
             soft_mask2=soft_mask2 if self.return_debug_tensors else None,
-            embedding1=embedding1 if self.return_debug_tensors else None,
-            embedding2=embedding2 if self.return_debug_tensors else None,
+            embedding1=None,
+            embedding2=None,
+            relation_map=relation_map if self.return_debug_tensors else None,
+            valid_map=valid_map if self.return_debug_tensors else None,
+            score_map=score_map if self.return_debug_tensors else None,
             valid_indices=valid.nonzero(as_tuple=False).squeeze(-1),
         )
