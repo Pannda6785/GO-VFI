@@ -1,0 +1,30 @@
+model:
+  backbone_source: torchhub
+  backbone_name: dinov2_vitb14
+  backbone_hf_name: facebook/dinov2-base
+  freeze_backbone: true
+  proj_dim: 256
+  num_heads: 8
+  dropout: 0.0
+
+data:
+  dataset_root: Datasets/vimeo_triplet_augmented_full
+  image_size: 518
+  patch_size: 14
+  min_patch_tokens: 1
+  crop_margin: 0.15
+  mask_threshold: 0.5
+  val_split: val
+
+train:
+  batch_size: 16
+  epochs: 20
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  pos_weight: 3.0
+  num_workers: 4
+  amp: true
+  output_dir: GOBC/outputs/base
+
+eval:
+  primary_metric: auroc

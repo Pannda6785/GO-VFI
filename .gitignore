@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 
 venv/
+.venv/
 
 # Ignore dataset payloads, but keep scripts and lightweight metadata in Datasets/.
 Datasets/**

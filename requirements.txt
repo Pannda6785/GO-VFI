@@ -2,7 +2,7 @@ torch==2.5.1
 torchvision==0.20.1
 opencv_python==4.13.0.92
 numpy==2.4.3
-cupy-cuda12x
+# cupy-cuda12x
 ultralytics
 easydict
 future

@@ -1,0 +1,35 @@
+model:
+  backbone_source: torchhub
+  backbone_name: dinov2_vitb14
+  backbone_hf_name: facebook/dinov2-base
+  freeze_backbone: true
+  proj_dim: 256
+  num_heads: 8
+  dropout: 0.0
+
+data:
+  dataset_root: Datasets/vimeo_triplet_augmented_full
+  image_size: 224
+  patch_size: 14
+  min_patch_tokens: 1
+  crop_margin: 0.15
+  mask_threshold: 0.5
+  val_split: val
+  subset_seed: 0
+  max_train_samples: 4096
+  max_val_samples: 512
+
+train:
+  batch_size: 2
+  epochs: 1
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  pos_weight: 3.0
+  num_workers: 0
+  amp: true
+  log_every_steps: 100
+  checkpoint_every_steps: 500
+  output_dir: Test/GOBC_smoke_20min
+
+eval:
+  primary_metric: auroc

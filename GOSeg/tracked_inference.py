@@ -9,10 +9,8 @@ from ultralytics import YOLO
 
 from inference import (
     apply_mask_to_image,
-    create_detection_output,
     create_pure_mask,
     load_efficient_sam_model,
-    visualize_results,
     run_efficient_sam_with_boxes,
 )
 
@@ -78,6 +76,11 @@ def annotate_track_detection(image, boxes, confidences, class_ids, track_ids, cl
             1,
         )
     return annotated
+
+
+def annotate_track_overlay(image, masks, boxes, confidences, class_ids, track_ids, class_names, alpha=0.4, line_width=2):
+    overlay = apply_mask_to_image(image, masks, alpha)
+    return annotate_track_detection(overlay, boxes, confidences, class_ids, track_ids, class_names, line_width)
 
 
 def save_track_artifacts(track_dir: Path, frame_stem: str, mask: np.ndarray, frame_bgr: np.ndarray, box, track_id: int):
@@ -168,12 +171,13 @@ def process_tracked_images(image_paths, yolo_model, sam_model, args, device, out
             class_names,
             args.line_width,
         )
-        combined_image = visualize_results(
+        combined_image = annotate_track_overlay(
             frame_bgr,
-            boxes,
             masks,
+            boxes,
             confidences,
             class_ids,
+            track_ids,
             class_names,
             args.alpha,
             args.line_width,
