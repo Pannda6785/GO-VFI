@@ -11,10 +11,10 @@ from unittest import mock
 import torch
 from PIL import Image
 
-from GOBC.data.pair_dataset import VimeoOverlayPairDataset, build_pair_index, derive_overlay_label
+from GOBC.data.pair_dataset import VimeoOverlayPairDataset, _overlay_has_motion, build_pair_index, derive_overlay_label
 from GOBC.models.cross_attention_matcher import PairwiseDifferenceModel, project_mask_to_patch_grid
 from GOBC.models.dinov2_backbone import DinoV2Backbone, infer_patch_grid
-from GOBC.train import prepare_epoch_subsets
+from GOBC.train import prepare_epoch_subsets, resolve_pos_weight_value
 
 
 class FakeTorchHubModel(torch.nn.Module):
@@ -65,6 +65,15 @@ class DummyDataset:
 
     def is_valid_index(self, index: int) -> bool:
         return index < self._valid_count
+
+
+class DummyLabeledDataset:
+    def __init__(self, labels: list[int], valid_indices: set[int]) -> None:
+        self.samples = [types.SimpleNamespace(label=label) for label in labels]
+        self._valid_indices = valid_indices
+
+    def is_valid_index(self, index: int) -> bool:
+        return index in self._valid_indices
 
 
 def write_png(path: Path, value: int) -> None:
@@ -227,6 +236,35 @@ class TestGOBC(unittest.TestCase):
             index = build_pair_index(Path(tmpdir) / "dataset", "train")
             self.assertEqual(index, [])
 
+    def test_different_overlay_with_motion_is_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "dataset" / "train" / "00001" / "0001"
+            (root / "overlays_masks").mkdir(parents=True)
+            write_rgb(root / "I0.png", 100)
+            write_rgb(root / "I1.png", 120)
+            write_png(root / "overlays_masks" / "000_I0.png", 255)
+            write_png(root / "overlays_masks" / "000_I1.png", 255)
+            metadata = {
+                "split": "train",
+                "source_rel": "00001/0001",
+                "scenechange": None,
+                "overlays": [
+                    {
+                        "object_id": "000",
+                        "center0": [16.0, 16.0],
+                        "center1": [18.0, 16.0],
+                        "geometry": {"mode": "motion", "motion_step": [0.1, 0.0]},
+                        "temporal": {"mode": "change_appearance", "detail": {"variant": "textual"}},
+                        "mask_paths": {"I0": "overlays_masks/000_I0.png", "I1": "overlays_masks/000_I1.png"},
+                    },
+                ],
+            }
+            (root / "metadata.json").write_text(json.dumps(metadata))
+
+            self.assertTrue(_overlay_has_motion(metadata["overlays"][0]))
+            index = build_pair_index(Path(tmpdir) / "dataset", "train")
+            self.assertEqual(index, [])
+
     def test_overlay_with_edge_adjacent_center_is_dropped(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "dataset" / "train" / "00001" / "0001"
@@ -329,6 +367,20 @@ class TestGOBC(unittest.TestCase):
         self.assertEqual(len(set(flattened)), 10)
         self.assertEqual(sorted(flattened), list(range(10)))
         self.assertEqual([len(subset) for subset in epoch_subsets], [4, 3, 3])
+
+    def test_full_dataset_run_prefilters_to_valid_indices(self) -> None:
+        config = {"data": {"subset_seed": 0}}
+        dataset = DummyDataset(split="train", valid_count=3, total_count=5)
+        epoch_subsets = prepare_epoch_subsets(config, dataset, "train", 2)
+        self.assertIsNotNone(epoch_subsets)
+        self.assertEqual(epoch_subsets, [[0, 1, 2], [0, 1, 2]])
+
+    def test_pos_weight_auto_can_cap_valid_overlay_count(self) -> None:
+        config = {"train": {"pos_weight": "auto", "pos_weight_max_valid_samples": 3}}
+        dataset = DummyLabeledDataset(labels=[1, 0, 0, 1, 1], valid_indices={0, 1, 2, 3, 4})
+        value = resolve_pos_weight_value(config, train_dataset=dataset)
+        self.assertEqual(value, 2.0)
+        self.assertEqual(config["train"]["resolved_pos_weight"], 2.0)
 
 
 if __name__ == "__main__":

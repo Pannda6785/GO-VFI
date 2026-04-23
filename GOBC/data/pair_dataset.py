@@ -113,6 +113,18 @@ def _overlay_centers_inside_frames(
     )
 
 
+def _overlay_has_motion(overlay: dict[str, Any]) -> bool:
+    geometry = overlay.get("geometry") or {}
+    if str(geometry.get("mode", "")).lower() == "motion":
+        return True
+    motion_step = geometry.get("motion_step") or ()
+    if isinstance(motion_step, (list, tuple)):
+        for value in motion_step:
+            if isinstance(value, (int, float)) and float(value) != 0.0:
+                return True
+    return False
+
+
 def build_pair_index(dataset_root: str | Path, split: str) -> list[OverlaySample]:
     if split not in VALID_SPLITS:
         raise ValueError(f"Unsupported split {split!r}. Expected one of {sorted(VALID_SPLITS)}.")
@@ -140,6 +152,8 @@ def build_pair_index(dataset_root: str | Path, split: str) -> list[OverlaySample
         for overlay in overlays:
             label = derive_overlay_label(overlay)
             if label is None:
+                continue
+            if label == 1 and _overlay_has_motion(overlay):
                 continue
 
             if not _overlay_centers_inside_frames(overlay, image1_size, image2_size):

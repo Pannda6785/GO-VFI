@@ -127,11 +127,21 @@ def prepare_epoch_subsets(
 ) -> list[list[int]] | None:
     split_limit_key = f"max_{split}_samples"
     split_limit = config["data"].get(split_limit_key)
+    subset_seed = int(config["data"].get("subset_seed", 0))
+
     if split_limit is None:
-        return None
+        valid_indices = _collect_valid_indices(
+            dataset,
+            len(dataset),
+            subset_seed,
+            progress_label=split,
+            allow_partial=True,
+        )
+        if not valid_indices:
+            raise RuntimeError(f"No valid samples available for split {split}.")
+        return [valid_indices for _ in range(max(num_epochs, 1))]
 
     split_limit = min(int(split_limit), len(dataset))
-    subset_seed = int(config["data"].get("subset_seed", 0))
 
     if split == "train" and bool(config["data"].get("distinct_train_subset_per_epoch", False)):
         required = split_limit * max(num_epochs, 1)
@@ -215,16 +225,27 @@ def resolve_pos_weight_value(
     if train_dataset is None:
         raise RuntimeError("train.pos_weight=auto requires the full filtered train dataset.")
 
+    max_valid_samples = config["train"].get("pos_weight_max_valid_samples")
+    max_valid_samples = int(max_valid_samples) if max_valid_samples is not None else None
+    if max_valid_samples is not None and max_valid_samples <= 0:
+        raise RuntimeError(
+            f"train.pos_weight_max_valid_samples must be positive when set, got {max_valid_samples}."
+        )
+
     positive = 0
     negative = 0
     checked = 0
+    valid_checked = 0
     for index, sample in enumerate(train_dataset.samples):
         checked += 1
         if train_dataset.is_valid_index(index):
+            valid_checked += 1
             if int(sample.label) == 1:
                 positive += 1
             else:
                 negative += 1
+            if max_valid_samples is not None and valid_checked >= max_valid_samples:
+                break
         if checked % 8192 == 0 or checked == len(train_dataset.samples):
             print(
                 json.dumps(
@@ -232,6 +253,8 @@ def resolve_pos_weight_value(
                         "phase": "pos_weight_resolution",
                         "checked": checked,
                         "total": len(train_dataset.samples),
+                        "valid_checked": valid_checked,
+                        "target_valid": max_valid_samples,
                         "positive": positive,
                         "negative": negative,
                     }
@@ -451,9 +474,13 @@ def train(args: argparse.Namespace) -> None:
     primary_metric = config["eval"].get("primary_metric", "auroc")
     log_every_steps = int(config["train"].get("log_every_steps", 100))
     checkpoint_every_steps = int(config["train"].get("checkpoint_every_steps", 0))
+    grad_accum_steps = int(config["train"].get("gradient_accumulation_steps", 1))
+    if grad_accum_steps <= 0:
+        raise RuntimeError(f"train.gradient_accumulation_steps must be positive, got {grad_accum_steps}.")
     max_grad_norm = config["train"].get("max_grad_norm")
     max_grad_norm = float(max_grad_norm) if max_grad_norm is not None else None
     total_epochs = int(config["train"]["epochs"])
+    optimizer_step_count = 0
 
     train_epoch_subsets = prepare_epoch_subsets(config, train_dataset, "train", total_epochs)
     val_epoch_subsets = prepare_epoch_subsets(config, val_dataset, val_split, 1)
@@ -477,9 +504,10 @@ def train(args: argparse.Namespace) -> None:
         )
         model.train()
         train_losses: list[float] = []
+        accumulated_micro_batches = 0
+        optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(train_loader):
             batch = move_batch(batch, device, include_label=False)
-            optimizer.zero_grad(set_to_none=True)
             autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
             with autocast_ctx:
                 output = model(batch["image1"], batch["mask1"], batch["image2"], batch["mask2"])
@@ -499,8 +527,18 @@ def train(args: argparse.Namespace) -> None:
             if not torch.isfinite(loss):
                 print(json.dumps({"epoch": epoch, "step": step + 1, "warning": "skipping_nonfinite_loss"}), flush=True)
                 continue
+            scaled_loss = loss / grad_accum_steps
             if use_amp:
-                scaler.scale(loss).backward()
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+            accumulated_micro_batches += 1
+            train_losses.append(loss.item())
+
+            if accumulated_micro_batches < grad_accum_steps:
+                continue
+
+            if use_amp:
                 if max_grad_norm is not None:
                     scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -509,6 +547,7 @@ def train(args: argparse.Namespace) -> None:
                     )
                     if not torch.isfinite(grad_norm):
                         optimizer.zero_grad(set_to_none=True)
+                        accumulated_micro_batches = 0
                         print(
                             json.dumps({"epoch": epoch, "step": step + 1, "warning": "skipping_nonfinite_grad_norm"}),
                             flush=True,
@@ -517,7 +556,6 @@ def train(args: argparse.Namespace) -> None:
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss.backward()
                 if max_grad_norm is not None:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         [param for param in model.parameters() if param.requires_grad],
@@ -525,19 +563,66 @@ def train(args: argparse.Namespace) -> None:
                     )
                     if not torch.isfinite(grad_norm):
                         optimizer.zero_grad(set_to_none=True)
+                        accumulated_micro_batches = 0
                         print(
                             json.dumps({"epoch": epoch, "step": step + 1, "warning": "skipping_nonfinite_grad_norm"}),
                             flush=True,
                         )
                         continue
                 optimizer.step()
-            train_losses.append(loss.item())
-            global_step = epoch * max(len(train_loader), 1) + step
-            writer.add_scalar("train/loss", loss.item(), global_step)
-            if log_every_steps > 0 and ((step + 1) % log_every_steps == 0 or step == 0):
-                print(json.dumps({"epoch": epoch, "step": step + 1, "train_loss": loss.item()}), flush=True)
-            if checkpoint_every_steps > 0 and (step + 1) % checkpoint_every_steps == 0:
+
+            optimizer.zero_grad(set_to_none=True)
+            accumulated_micro_batches = 0
+            optimizer_step_count += 1
+            writer.add_scalar("train/loss", loss.item(), optimizer_step_count)
+            if log_every_steps > 0 and (optimizer_step_count % log_every_steps == 0 or optimizer_step_count == 1):
+                print(
+                    json.dumps(
+                        {"epoch": epoch, "step": optimizer_step_count, "micro_step": step + 1, "train_loss": loss.item()}
+                    ),
+                    flush=True,
+                )
+            if checkpoint_every_steps > 0 and optimizer_step_count % checkpoint_every_steps == 0:
                 save_checkpoint(output_dir / "latest_step.pt", model, optimizer, epoch, best_metric, config)
+
+        if accumulated_micro_batches > 0:
+            if use_amp:
+                if max_grad_norm is not None:
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        [param for param in model.parameters() if param.requires_grad],
+                        max_grad_norm,
+                    )
+                    if not torch.isfinite(grad_norm):
+                        optimizer.zero_grad(set_to_none=True)
+                        accumulated_micro_batches = 0
+                        print(json.dumps({"epoch": epoch, "warning": "skipping_nonfinite_grad_norm_tail"}), flush=True)
+                    else:
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer_step_count += 1
+                else:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer_step_count += 1
+            else:
+                if max_grad_norm is not None:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        [param for param in model.parameters() if param.requires_grad],
+                        max_grad_norm,
+                    )
+                    if not torch.isfinite(grad_norm):
+                        optimizer.zero_grad(set_to_none=True)
+                        accumulated_micro_batches = 0
+                        print(json.dumps({"epoch": epoch, "warning": "skipping_nonfinite_grad_norm_tail"}), flush=True)
+                    else:
+                        optimizer.step()
+                        optimizer_step_count += 1
+                else:
+                    optimizer.step()
+                    optimizer_step_count += 1
+            optimizer.zero_grad(set_to_none=True)
+            accumulated_micro_batches = 0
 
         debug_log({"phase": "train_epoch_done", "epoch": epoch})
         maybe_cleanup_device(device)
